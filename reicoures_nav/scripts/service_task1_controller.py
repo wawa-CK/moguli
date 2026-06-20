@@ -10,7 +10,7 @@ from face_rec.srv import recognition_results, recognition_resultsRequest
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from rei_voice.msg import REIResult
-from rei_voice.srv import REITts, REITtsRequest
+from rei_voice.srv import REIPlayer, REIPlayerRequest
 from std_srvs.srv import SetBool, SetBoolRequest
 
 
@@ -22,19 +22,28 @@ class ServiceTask1Controller:
         self.target_w = rospy.get_param("~target_w", 1.0)
         self.face_poll_interval = rospy.get_param("~face_poll_interval", 1.0)
         self.command_timeout = rospy.get_param("~command_timeout", 20.0)
+
         self.face_service = rospy.get_param("~face_service", "/face_recognition_results")
         self.record_service = rospy.get_param("~record_service", "/REIService/RecordAudio")
-        self.tts_service = rospy.get_param("~tts_service", "/REIService/voice_tts")
+        self.player_service = rospy.get_param("~player_service", "/REIService/PcmPlayer")
         self.aiui_result_topic = rospy.get_param("~aiui_result_topic", "/REITopic/AIUIResult")
         self.pose_topic = rospy.get_param("~pose_topic", "/amcl_pose")
 
+        self.welcome_audio = rospy.get_param("~welcome_audio", "./REIAIUI/audio/tts1.pcm")
+        self.guide_ack_audio = rospy.get_param("~guide_ack_audio", "./REIAIUI/audio/tts1.pcm")
+        self.intro_audio = rospy.get_param("~intro_audio", "./REIAIUI/audio/tts2.pcm")
+        self.return_audio = rospy.get_param("~return_audio", "./REIAIUI/audio/tts3.pcm")
+        self.retry_audio = rospy.get_param("~retry_audio", "./REIAIUI/audio/tts1.pcm")
+        self.nav_fail_audio = rospy.get_param("~nav_fail_audio", "./REIAIUI/audio/tts1.pcm")
+        self.return_fail_audio = rospy.get_param("~return_fail_audio", "./REIAIUI/audio/tts1.pcm")
+        self.done_audio = rospy.get_param("~done_audio", "./REIAIUI/audio/tts3.pcm")
+
         self.face_client = rospy.ServiceProxy(self.face_service, recognition_results)
         self.record_client = rospy.ServiceProxy(self.record_service, SetBool)
-        self.tts_client = rospy.ServiceProxy(self.tts_service, REITts)
+        self.player_client = rospy.ServiceProxy(self.player_service, REIPlayer)
         self.move_base_client = actionlib.SimpleActionClient("move_base", MoveBaseAction)
 
         self.start_pose = None
-        self.latest_pose = None
         self.latest_iat_text = ""
         self.command_event = threading.Event()
 
@@ -42,10 +51,9 @@ class ServiceTask1Controller:
         rospy.Subscriber(self.aiui_result_topic, REIResult, self.aiui_result_cb, queue_size=10)
 
     def pose_cb(self, msg):
-        self.latest_pose = msg.pose.pose
         if self.start_pose is None:
             self.start_pose = msg.pose.pose
-            rospy.loginfo("已记录初始位姿，任务结束后将返回此位置")
+            rospy.loginfo("Initial pose recorded for return navigation")
 
     def aiui_result_cb(self, msg):
         if getattr(msg, "type", "") != "iat":
@@ -56,41 +64,40 @@ class ServiceTask1Controller:
             return
 
         self.latest_iat_text = text
-        rospy.loginfo("识别到语音文本：%s", text)
+        rospy.loginfo("Recognized speech: %s", text)
         self.command_event.set()
 
     def wait_for_dependencies(self):
-        rospy.loginfo("等待依赖服务和动作服务器...")
+        rospy.loginfo("Waiting for required services and move_base")
         rospy.wait_for_service(self.face_service, timeout=20)
         rospy.wait_for_service(self.record_service, timeout=20)
-        rospy.wait_for_service(self.tts_service, timeout=20)
+        rospy.wait_for_service(self.player_service, timeout=20)
         if not self.move_base_client.wait_for_server(rospy.Duration(20)):
-            raise rospy.ROSException("move_base 动作服务器未就绪")
-        rospy.loginfo("依赖接口已就绪")
+            raise rospy.ROSException("move_base action server is not ready")
+        rospy.loginfo("All required interfaces are ready")
 
     def set_recording(self, enabled):
         try:
             response = self.record_client.call(SetBoolRequest(enabled))
-            rospy.loginfo("录音状态切换为 %s: %s", enabled, response.message)
+            rospy.loginfo("RecordAudio set to %s: %s", enabled, response.message)
             return response.success
         except rospy.ServiceException as exc:
-            rospy.logerr("调用录音服务失败: %s", exc)
+            rospy.logerr("RecordAudio service call failed: %s", exc)
             return False
 
-    def speak(self, text):
-        rospy.loginfo("播报：%s", text)
+    def play_audio(self, audio_path, label):
+        rospy.loginfo("Playing %s: %s", label, audio_path)
         self.set_recording(False)
         try:
-            request = REITtsRequest()
-            request.text = text
-            request.is_play = True
-            response = self.tts_client.call(request)
+            request = REIPlayerRequest()
+            request.PcmPath = audio_path
+            response = self.player_client.call(request)
             if not response.success:
-                rospy.logerr("TTS 播报失败：%s", response.message)
+                rospy.logerr("PCM playback failed: %s", response.message)
                 return False
             return True
         except rospy.ServiceException as exc:
-            rospy.logerr("调用 TTS 服务失败: %s", exc)
+            rospy.logerr("PcmPlayer service call failed: %s", exc)
             return False
 
     def detect_face(self):
@@ -100,7 +107,7 @@ class ServiceTask1Controller:
             request.str = "/head_camera/image_raw"
             response = self.face_client.call(request)
             if not response.success:
-                rospy.logwarn("人脸识别服务返回失败：%s", response.message)
+                rospy.logwarn("Face recognition failed: %s", response.message)
                 return []
 
             labels = []
@@ -108,16 +115,17 @@ class ServiceTask1Controller:
                 labels.append(face_data.header.frame_id)
             return labels
         except rospy.ServiceException as exc:
-            rospy.logerr("调用人脸识别服务失败: %s", exc)
+            rospy.logerr("Face recognition service call failed: %s", exc)
             return []
 
     def wait_for_face(self):
-        rate = rospy.Rate(max(1.0 / self.face_poll_interval, 0.2))
-        rospy.loginfo("进入待机，轮询人脸识别中...")
+        rate_hz = max(1.0 / self.face_poll_interval, 0.2)
+        rate = rospy.Rate(rate_hz)
+        rospy.loginfo("Waiting for face detection trigger")
         while not rospy.is_shutdown():
             labels = self.detect_face()
             if labels:
-                rospy.loginfo("检测到人脸：%s", labels)
+                rospy.loginfo("Detected faces: %s", labels)
                 return True
             rate.sleep()
         return False
@@ -131,7 +139,7 @@ class ServiceTask1Controller:
         )
 
     def wait_for_command(self):
-        rospy.loginfo("开始等待导览命令")
+        rospy.loginfo("Waiting for guide command")
         self.latest_iat_text = ""
         self.command_event.clear()
         self.set_recording(True)
@@ -144,10 +152,10 @@ class ServiceTask1Controller:
             text = self.latest_iat_text
             self.command_event.clear()
             if self.command_matches(text):
-                rospy.loginfo("导览命令匹配成功")
+                rospy.loginfo("Guide command matched")
                 return True
 
-            rospy.logwarn("语音内容不匹配导览命令：%s", text)
+            rospy.logwarn("Speech does not match guide command: %s", text)
         return False
 
     def nav_to_pose(self, x, y, z, w, label):
@@ -159,25 +167,32 @@ class ServiceTask1Controller:
         goal.target_pose.pose.orientation.z = z
         goal.target_pose.pose.orientation.w = w
 
-        rospy.loginfo("开始导航到%s: x=%.3f y=%.3f z=%.3f w=%.3f", label, x, y, z, w)
+        rospy.loginfo(
+            "Navigating to %s: x=%.3f y=%.3f z=%.3f w=%.3f",
+            label,
+            x,
+            y,
+            z,
+            w,
+        )
         self.move_base_client.send_goal(goal)
         finished = self.move_base_client.wait_for_result(rospy.Duration(120))
         if not finished:
             self.move_base_client.cancel_goal()
-            rospy.logerr("导航到%s超时", label)
+            rospy.logerr("Navigation to %s timed out", label)
             return False
 
         state = self.move_base_client.get_state()
         if state == GoalStatus.SUCCEEDED:
-            rospy.loginfo("成功到达%s", label)
+            rospy.loginfo("Reached %s", label)
             return True
 
-        rospy.logerr("导航到%s失败，状态码：%s", label, state)
+        rospy.logerr("Navigation to %s failed, state=%s", label, state)
         return False
 
     def return_to_start(self):
         if self.start_pose is None:
-            rospy.logerr("未获取到初始位姿，无法返回出发区")
+            rospy.logerr("No initial pose available for return navigation")
             return False
 
         pose = self.start_pose
@@ -186,44 +201,41 @@ class ServiceTask1Controller:
             pose.position.y,
             pose.orientation.z,
             pose.orientation.w,
-            "出发区",
+            "start_area",
         )
 
     def run(self):
         self.wait_for_dependencies()
 
         if self.start_pose is None:
-            rospy.logwarn("暂未收到 /amcl_pose，回航将等待初始位姿")
+            rospy.logwarn("No /amcl_pose received yet, return navigation will wait for it")
 
         if not self.wait_for_face():
             return
 
-        self.speak("你好，欢迎您的到来！有什么需要帮助的吗？")
+        self.play_audio(self.welcome_audio, "welcome_audio")
 
         if not self.wait_for_command():
-            self.speak("我没有听清楚，请您再说一遍。")
+            self.play_audio(self.retry_audio, "retry_audio")
             self.set_recording(False)
             return
 
-        self.speak("好的，请跟我来。")
+        self.play_audio(self.guide_ack_audio, "guide_ack_audio")
 
-        if not self.nav_to_pose(self.target_x, self.target_y, self.target_z, self.target_w, "深圳馆"):
-            self.speak("抱歉，我暂时无法到达深圳馆。")
+        if not self.nav_to_pose(self.target_x, self.target_y, self.target_z, self.target_w, "shenzhen_hall"):
+            self.play_audio(self.nav_fail_audio, "nav_fail_audio")
             self.set_recording(False)
             return
 
-        self.speak(
-            "深圳，是广东副省级市、经济特区。毗邻香港，经济发达，创新力强，"
-            "有众多世界五百强企业，是粤港澳大湾区中心城市。"
-        )
-        self.speak("这里就是深圳馆啦，我要继续回去工作啦！")
+        self.play_audio(self.intro_audio, "intro_audio")
+        self.play_audio(self.return_audio, "return_audio")
 
         if not self.return_to_start():
-            self.speak("抱歉，我暂时无法返回出发区。")
+            self.play_audio(self.return_fail_audio, "return_fail_audio")
             self.set_recording(False)
             return
 
-        self.speak("我已经回到出发区，继续待机。")
+        self.play_audio(self.done_audio, "done_audio")
         self.set_recording(False)
 
 
@@ -233,9 +245,9 @@ def main():
     try:
         controller.run()
     except rospy.ROSInterruptException:
-        rospy.logwarn("节点被中断")
+        rospy.logwarn("Node interrupted")
     except Exception as exc:
-        rospy.logerr("任务执行异常: %s", exc)
+        rospy.logerr("Task failed: %s", exc)
 
 
 if __name__ == "__main__":
