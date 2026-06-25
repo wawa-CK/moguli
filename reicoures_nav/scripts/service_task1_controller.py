@@ -16,10 +16,11 @@ from std_srvs.srv import SetBool, SetBoolRequest
 
 class ServiceTask1Controller:
     def __init__(self):
-        self.target_x = rospy.get_param("~target_x", 2.543)
-        self.target_y = rospy.get_param("~target_y", 2.148)
+        self.target_x = rospy.get_param("~target_x", 1.0422315177553685)
+        self.target_y = rospy.get_param("~target_y", 1.1745596747551745)
         self.target_z = rospy.get_param("~target_z", 0.0)
         self.target_w = rospy.get_param("~target_w", 1.0)
+        self.nav_frame = rospy.get_param("~nav_frame", "map")
         self.face_poll_interval = rospy.get_param("~face_poll_interval", 1.0)
         self.command_timeout = rospy.get_param("~command_timeout", 20.0)
 
@@ -100,6 +101,12 @@ class ServiceTask1Controller:
             rospy.logerr("PcmPlayer service call failed: %s", exc)
             return False
 
+    def play_audio_once_for_step(self, audio_path, label, previous_audio_path=None):
+        if previous_audio_path and audio_path == previous_audio_path:
+            rospy.loginfo("Skipping %s because it is the same as the previous audio", label)
+            return True
+        return self.play_audio(audio_path, label)
+
     def detect_face(self):
         try:
             request = recognition_resultsRequest()
@@ -132,7 +139,7 @@ class ServiceTask1Controller:
 
     def command_matches(self, text):
         normalized = text.replace(" ", "")
-        guide_keywords = ("带我去", "参观", "导览")
+        guide_keywords = ("带我去", "参观")
         place_keywords = ("深圳馆", "深圳")
         return any(word in normalized for word in guide_keywords) and any(
             word in normalized for word in place_keywords
@@ -160,10 +167,10 @@ class ServiceTask1Controller:
 
     def nav_to_pose(self, x, y, z, w, label):
         goal = MoveBaseGoal()
-        goal.target_pose.header.frame_id = "map"
+        goal.target_pose.header.frame_id = self.nav_frame
         goal.target_pose.header.stamp = rospy.Time.now()
         goal.target_pose.pose.position.x = x
-        goal.target_pose.pose.position.y = y
+        goal.target_pose.pose.position.y = y 
         goal.target_pose.pose.orientation.z = z
         goal.target_pose.pose.orientation.w = w
 
@@ -220,7 +227,11 @@ class ServiceTask1Controller:
             self.set_recording(False)
             return
 
-        self.play_audio(self.guide_ack_audio, "guide_ack_audio")
+        self.play_audio_once_for_step(
+            self.guide_ack_audio,
+            "guide_ack_audio",
+            previous_audio_path=self.welcome_audio,
+        )
 
         if not self.nav_to_pose(self.target_x, self.target_y, self.target_z, self.target_w, "shenzhen_hall"):
             self.play_audio(self.nav_fail_audio, "nav_fail_audio")
