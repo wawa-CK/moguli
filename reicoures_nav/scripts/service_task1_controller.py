@@ -20,7 +20,7 @@ class ServiceTask1Controller:
         self.target_y = rospy.get_param("~target_y", 1.1745596747551745)
         self.target_z = rospy.get_param("~target_z", 0.0)
         self.target_w = rospy.get_param("~target_w", 1.0)
-        self.nav_frame = rospy.get_param("~nav_frame", "map")
+        self.nav_frame = rospy.get_param("~nav_frame", "map")#修改的是这里，地图用错了
         self.face_poll_interval = rospy.get_param("~face_poll_interval", 1.0)
         self.command_timeout = rospy.get_param("~command_timeout", 20.0)
 
